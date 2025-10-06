@@ -1,0 +1,2 @@
+requests>=2.31.0
+pyedhrec>=0.0.2
