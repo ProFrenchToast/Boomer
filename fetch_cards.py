@@ -1,9 +1,11 @@
 import requests
 import json
 import time
-from typing import List, Dict, Set
+import re
+from typing import List, Dict, Set, Optional
 
 SCRYFALL_API = "https://api.scryfall.com"
+EDHREC_JSON_API = "https://json.edhrec.com/pages/cards"
 USER_AGENT = "Boomer-MTG-Format/1.0"
 RATE_LIMIT_DELAY = 0.1
 
@@ -54,26 +56,53 @@ def fetch_commander_only_cards() -> List[Dict]:
     print(f"  Found {len(cards)} Commander-only cards")
     return cards
 
-def fetch_high_inclusion_cards(threshold_percent: float = 20.0) -> List[Dict]:
+def sanitize_card_name(name: str) -> str:
+    """
+    Sanitize card name for EDHREC URL format.
+    Example: "Uril, the Miststalker" -> "uril-the-miststalker"
+    """
+    sanitized = name.lower()
+    sanitized = re.sub(r'[^a-z0-9\s-]', '', sanitized)
+    sanitized = re.sub(r'\s+', '-', sanitized)
+    sanitized = re.sub(r'-+', '-', sanitized)
+    return sanitized.strip('-')
+
+def get_edhrec_inclusion(card_name: str) -> Optional[float]:
+    """
+    Fetch actual inclusion percentage from EDHREC JSON API.
+    Returns None if the data is not available.
+    """
+    sanitized = sanitize_card_name(card_name)
+    url = f"{EDHREC_JSON_API}/{sanitized}.json"
+
+    try:
+        response = requests.get(url, headers={"User-Agent": USER_AGENT})
+        if response.status_code != 200:
+            return None
+
+        data = response.json()
+        label = data.get("container", {}).get("json_dict", {}).get("card", {}).get("label", "")
+
+        # Parse label like: "In 700 decks \n0.09% of 814495 decks"
+        match = re.search(r'(\d+\.?\d*)%', label)
+        if match:
+            return float(match.group(1))
+
+        return None
+    except Exception as e:
+        print(f"    Warning: Could not fetch EDHREC data for {card_name}: {e}")
+        return None
+
+def fetch_high_inclusion_cards(threshold_percent: float = 7.5) -> List[Dict]:
     """
     Fetch cards with high inclusion rates in EDH decks.
-
-    Note: Since EDHREC doesn't provide global inclusion rates easily,
-    we'll use Scryfall's EDHREC rank as a proxy. Lower rank = higher inclusion.
-
-    We'll fetch top N cards by EDHREC rank and estimate inclusion.
+    Uses actual inclusion data from EDHREC JSON API.
+    Stops when we encounter a card below the threshold.
     """
     print(f"Fetching high-inclusion cards (>{threshold_percent}% inclusion)...")
-    print("  Note: Using Scryfall EDHREC rank as proxy for inclusion rate")
+    print("  Using actual EDHREC inclusion data")
 
     cards = []
-
-    # Scryfall's EDHREC ranking goes from 1 (most played) upward
-    # Approximately top 1000-1500 cards have >20% inclusion in the format
-    # We'll fetch cards sorted by EDHREC rank and estimate inclusion
-
-    # For simplicity, we'll fetch the top N cards by EDHREC rank
-    # This is an approximation since exact inclusion % isn't readily available
 
     url = f"{SCRYFALL_API}/cards/search"
     query = "format:commander"
@@ -87,14 +116,11 @@ def fetch_high_inclusion_cards(threshold_percent: float = 20.0) -> List[Dict]:
         "Accept": "application/json"
     }
 
-    # Fetch top cards by EDHREC rank
-    # We'll use an estimated cutoff based on rank
-    # Typically, cards ranked < 1500 have >20% inclusion
-    max_rank_for_threshold = 1500
-
     page = 1
+    cards_checked = 0
+
     while url:
-        print(f"  Fetching page {page}...")
+        print(f"  Fetching Scryfall page {page}...")
         response = requests.get(url, params=params if page == 1 else None, headers=headers)
 
         if response.status_code != 200:
@@ -104,23 +130,37 @@ def fetch_high_inclusion_cards(threshold_percent: float = 20.0) -> List[Dict]:
         data = response.json()
 
         for card in data.get("data", []):
+            cards_checked += 1
+            card_name = card.get("name")
             edhrec_rank = card.get("edhrec_rank")
 
-            if edhrec_rank and edhrec_rank <= max_rank_for_threshold:
-                # Rough estimate: rank 1 = ~80% inclusion, rank 1500 = ~20% inclusion
-                estimated_inclusion = max(20.0, 80.0 - (edhrec_rank / 25))
+            if cards_checked % 25 == 0:
+                print(f"    Checked {cards_checked} cards, found {len(cards)} above threshold...")
 
+            # Fetch actual inclusion from EDHREC
+            inclusion_percent = get_edhrec_inclusion(card_name)
+
+            if inclusion_percent is None:
+                # Skip cards without EDHREC data
+                continue
+
+            if inclusion_percent >= threshold_percent:
                 cards.append({
-                    "name": card.get("name"),
+                    "name": card_name,
                     "oracle_text": card.get("oracle_text", ""),
-                    "reason": f"high_inclusion: ~{estimated_inclusion:.1f}%",
-                    "edhrec_rank": edhrec_rank
+                    "reason": f"high_inclusion: {inclusion_percent:.2f}%",
+                    "edhrec_rank": edhrec_rank,
+                    "inclusion_percent": inclusion_percent
                 })
-            elif edhrec_rank and edhrec_rank > max_rank_for_threshold:
-                # Once we pass the threshold, we can stop
-                print(f"  Reached rank threshold ({edhrec_rank} > {max_rank_for_threshold}), stopping")
+            else:
+                # Once we find a card below threshold, stop
+                print(f"  Reached inclusion threshold: {card_name} has {inclusion_percent:.2f}% < {threshold_percent}%")
+                print(f"  Stopping after checking {cards_checked} cards")
                 url = None
                 break
+
+            # Rate limit for EDHREC API
+            time.sleep(RATE_LIMIT_DELAY)
 
         if url and data.get("has_more", False):
             url = data.get("next_page")
@@ -162,11 +202,15 @@ def merge_card_lists(commander_only: List[Dict], high_inclusion: List[Dict]) -> 
             }
             if "edhrec_rank" in card:
                 card_dict[name]["edhrec_rank"] = card["edhrec_rank"]
+            if "inclusion_percent" in card:
+                card_dict[name]["inclusion_percent"] = card["inclusion_percent"]
         else:
             if card["reason"] not in card_dict[name]["reasons"]:
                 card_dict[name]["reasons"].append(card["reason"])
             if "edhrec_rank" in card:
                 card_dict[name]["edhrec_rank"] = card["edhrec_rank"]
+            if "inclusion_percent" in card:
+                card_dict[name]["inclusion_percent"] = card["inclusion_percent"]
 
     merged_cards = list(card_dict.values())
 
@@ -184,7 +228,7 @@ def main():
     print("Starting MTG card list generation for new format...\n")
 
     commander_only = fetch_commander_only_cards()
-    high_inclusion = fetch_high_inclusion_cards(threshold_percent=20.0)
+    high_inclusion = fetch_high_inclusion_cards(threshold_percent=3.5)
 
     merged_cards = merge_card_lists(commander_only, high_inclusion)
 
